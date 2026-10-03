@@ -62,6 +62,13 @@ view_finalize(struct view *view)
 int
 view_attach(struct view *view, struct wld_buffer *buffer)
 {
+//  fprintf(stderr,
+//    "view_attach_init: view=%p impl=%p attach=%p buffer=%p\n",
+//    view,
+//    view->impl,
+//    view->impl->attach,
+//    buffer);
+
 	int ret;
 	struct view_handler *handler;
 
@@ -79,6 +86,13 @@ view_attach(struct view *view, struct wld_buffer *buffer)
 
 	view->buffer = buffer;
 	HANDLE(view, handler, attach);
+
+//  fprintf(stderr,
+//    "view_attach_last: view=%p impl=%p attach=%p buffer=%p\n",
+//    view,
+//    view->impl,
+//    view->impl->attach,
+//    buffer);
 
 	return 0;
 }

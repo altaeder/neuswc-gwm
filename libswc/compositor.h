@@ -37,7 +37,10 @@ struct wld_font;
 struct decor_part_buffer {
 	void *data;
 	struct wld_buffer *buffer;
+	struct wld_buffer *tiled_buffer;
 	uint32_t width, height, stride;
+	uint32_t tiled_width, tiled_height;
+	bool opaque;
 };
 
 struct swc_compositor {
@@ -64,6 +67,8 @@ struct compositor_view {
 	struct view base;
 	struct surface *surface;
 	struct wld_buffer *buffer;
+	bool buffer_opaque_valid;
+	bool buffer_opaque;
 	struct window *window;
 	struct compositor_view *parent;
 	int32_t buffer_offset_x;
@@ -137,6 +142,10 @@ void
 compositor_view_show(struct compositor_view *view);
 void
 compositor_view_hide(struct compositor_view *view);
+
+// Ω PATCH: change pointer focus on layer mapping state change
+void
+compositor_update_pointer_focus(void);
 
 void
 compositor_view_set_border_color(struct compositor_view *view,

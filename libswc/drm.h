@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "backend.h"
+
 struct wl_list;
 struct wld_buffer;
 
@@ -12,6 +14,7 @@ struct drm_handler {
 };
 
 struct swc_drm {
+	struct swc_backend backend;
 	int fd;
 	uint32_t cursor_w, cursor_h;
 	struct wld_context *context;

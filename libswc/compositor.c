@@ -28,9 +28,14 @@
  */
 
 #include "compositor.h"
+#include "backend.h"
 #include "data_device_manager.h"
 #include "decor.h"
+
+#ifdef ENABLE_DRM
 #include "drm.h"
+#endif
+
 #include "event.h"
 #include "internal.h"
 #include "launch.h"
@@ -47,16 +52,23 @@
 #include "view.h"
 #include "window.h"
 
+// shaders
+#include "effects/effects.h"
+
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#ifdef ENABLE_DRM
 #include <wld/drm.h>
+#endif
+
 #include <wld/wld.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
-#define DEFAULT_BG 0xff000000u
+#define DEFAULT_BG 0xff202020u
 
 static inline int32_t
 clamp_i32(int64_t v)
@@ -100,6 +112,20 @@ handle_motion(struct pointer_handler *handler, uint32_t time, wl_fixed_t x,
 static bool
 handle_button(struct pointer_handler *handler, uint32_t time,
               struct button *button, uint32_t state);
+
+static bool
+rectangle_on_any_screen(const struct swc_rectangle *r)
+{
+  struct screen *screen;
+  wl_list_for_each(screen, &swc.screens, link) {
+    struct swc_rectangle *sg = &screen->base.geometry;
+    bool h = r->x + (int32_t)r->width > sg->x && r->x < sg->x + (int32_t)sg->width;
+    bool v = r->y + (int32_t)r->height > sg->y && r->y < sg->y + (int32_t)sg->height;
+    if (h && v) return true;
+  }
+  return false;
+}
+
 static void
 perform_update(void *data);
 
@@ -213,9 +239,18 @@ target_new(struct screen *screen)
 		goto error0;
 	}
 
+  // ----------------------- POTENTIALLY IMPORTANT! --------------------------
+
 	target->surface =
-	    wld_create_surface(swc.drm->context, geom->width, geom->height,
-	                       WLD_FORMAT_XRGB8888, WLD_DRM_FLAG_SCANOUT);
+	    wld_create_surface(swc.backend->context, geom->width, geom->height,
+	                       WLD_FORMAT_XRGB8888,
+#ifdef ENABLE_DRM
+	                       WLD_DRM_FLAG_SCANOUT
+#else
+	                       WLD_FLAG_MAP
+#endif
+	    );
+  // ----------------------- POTENTIALLY IMPORTANT! --------------------------
 
 	if (!target->surface) {
 		goto error1;
@@ -239,6 +274,81 @@ error0:
 }
 
 /* Rendering {{{ */
+
+/* check the client's window buffer is opaque */
+static bool
+view_buffer_is_opaque(struct compositor_view *view)
+{
+	const struct swc_rectangle *geom = &view->base.geometry;
+	struct wld_buffer *buffer = view->base.buffer;
+	uint32_t x1, y1, width, height;
+
+	if (view->buffer_opaque_valid) {
+		return view->buffer_opaque;
+	}
+
+	view->buffer_opaque_valid = true;
+	view->buffer_opaque = false;
+
+  if (!buffer)
+  {
+    return false;
+  }
+
+  /* Ω
+    XRGB is opaque by definition.
+    Doing this avoids unneeded memcpy() calls. */
+	if (buffer->format = WLD_FORMAT_XRGB8888)
+	{
+		return true;
+	}
+
+	if (buffer->format != WLD_FORMAT_ARGB8888)
+	{
+		return false;
+	}
+
+	if (view->window) {
+		if (view->buffer_offset_x < 0 || view->buffer_offset_y < 0) {
+			return false;
+		}
+		x1 = (uint32_t)view->buffer_offset_x;
+		y1 = (uint32_t)view->buffer_offset_y;
+		width = geom->width;
+		height = geom->height;
+	} else {
+		x1 = 0;
+		y1 = 0;
+		width = buffer->width;
+		height = buffer->height;
+	}
+
+	if (x1 > buffer->width || y1 > buffer->height ||
+	    width > buffer->width - x1 || height > buffer->height - y1 ||
+	    !wld_map(buffer)) {
+		return false;
+	}
+
+	view->buffer_opaque = true;
+	for (uint32_t y = 0; y < height && view->buffer_opaque; ++y) {
+		const uint8_t *row = (const uint8_t *)buffer->map +
+		                     (size_t)(y1 + y) * buffer->pitch +
+		                     (size_t)x1 * 4;
+
+		for (uint32_t x = 0; x < width; ++x) {
+			uint32_t pixel;
+
+			memcpy(&pixel, row + (size_t)x * 4, sizeof(pixel));
+			if ((pixel >> 24) != 0xff) {
+				view->buffer_opaque = false;
+				break;
+			}
+		}
+	}
+	wld_unmap(buffer);
+
+	return view->buffer_opaque;
+}
 
 static void
 repaint_view(struct target *target, struct compositor_view *view,
@@ -286,13 +396,70 @@ repaint_view(struct target *target, struct compositor_view *view,
 	pixman_region32_intersect(&border_damage, &view_damage, &border_region);
 	pixman_region32_intersect(&buffer_damage, &view_damage, &buffer_region);
 
-	if (pixman_region32_not_empty(&buffer_damage)) {
-		pixman_region32_translate(&buffer_damage,
+
+	if (pixman_region32_not_empty(&buffer_damage))
+	{
+    pixman_region32_translate(&buffer_damage,
 		                          -geom->x + view->buffer_offset_x,
 		                          -geom->y + view->buffer_offset_y);
-		wld_copy_region(swc.drm->renderer, view->buffer, buf_x - target_geom->x,
-		                buf_y - target_geom->y, &buffer_damage);
-	}
+		if (view->buffer->format == WLD_FORMAT_ARGB8888) {
+			pixman_region32_t opaque_damage, blend_damage;
+
+			/* keep pixels that we know are opaque on the accelerated path; only
+			 * pixels which might have alpha need blending. */
+			pixman_region32_init(&opaque_damage);
+			pixman_region32_intersect(&opaque_damage, &buffer_damage,
+			                          &view->surface->state.opaque);
+			pixman_region32_init(&blend_damage);
+			pixman_region32_subtract(&blend_damage, &buffer_damage,
+			                         &opaque_damage);
+      // ↓ Ω BLUR time B-)
+      if (pixman_region32_not_empty(&view->surface->state.blur))
+      {
+        // ↓ Ω Shader call B-)
+        effects_apply(
+                      swc.backend->renderer,
+                      view,
+                      buf_x - target_geom->x, //x,
+                      buf_y - target_geom->y, //y);
+                      &blend_damage);
+      }
+
+			if (!pixman_region32_not_empty(&blend_damage) ||
+			    view_buffer_is_opaque(view)) {
+				wld_copy_region(swc.backend->renderer, view->buffer,
+				                buf_x - target_geom->x,
+				                buf_y - target_geom->y, &buffer_damage);
+			} else {
+				wld_copy_region(swc.backend->renderer, view->buffer,
+				                buf_x - target_geom->x,
+				                buf_y - target_geom->y, &opaque_damage);
+				wld_blend_region(swc.backend->renderer, view->buffer,
+				                 buf_x - target_geom->x,
+				                 buf_y - target_geom->y, &blend_damage);
+			}
+
+			pixman_region32_fini(&blend_damage);
+			pixman_region32_fini(&opaque_damage);
+		} else {
+      // ↓ Ω Blur time final frame
+      if (pixman_region32_not_empty(&view->surface->state.blur))
+      {
+        // ↓ Ω Shader call B-)
+        effects_apply(
+                      swc.backend->renderer,
+                      view,
+                      buf_x - target_geom->x, //x,
+                      buf_y - target_geom->y, //y);
+                      &buffer_damage);
+      }
+
+			wld_copy_region(swc.backend->renderer, view->buffer,
+			                buf_x - target_geom->x, buf_y - target_geom->y,
+			                &buffer_damage);
+		}
+  }
+
 
 	pixman_region32_fini(&view_damage);
 	pixman_region32_fini(&buffer_damage);
@@ -321,12 +488,12 @@ repaint_view(struct target *target, struct compositor_view *view,
 	if (view->border.outwidth > 0 && pixman_region32_not_empty(&out_border)) {
 		pixman_region32_translate(&out_border, -target_geom->x,
 		                          -target_geom->y);
-		wld_fill_region(swc.drm->renderer, view->border.outcolor, &out_border);
+		wld_fill_region(swc.backend->renderer, view->border.outcolor, &out_border);
 	}
 
 	if (view->border.inwidth > 0 && pixman_region32_not_empty(&in_border)) {
 		pixman_region32_translate(&in_border, -target_geom->x, -target_geom->y);
-		wld_fill_region(swc.drm->renderer, view->border.incolor, &in_border);
+		wld_fill_region(swc.backend->renderer, view->border.incolor, &in_border);
 	}
 
 	pixman_region32_fini(&border_damage);
@@ -336,7 +503,7 @@ repaint_view(struct target *target, struct compositor_view *view,
 
 	if ((view->decor.top || view->decor.right || view->decor.bottom ||
 	     view->decor.left)) {
-		decor_repaint(swc.drm->renderer, target_geom, view, damage);
+		decor_repaint(swc.backend->renderer, target_geom, view, damage);
 	}
 }
 
@@ -396,16 +563,22 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
 	struct compositor_view *view;
 	const struct swc_rectangle *target_geom = &target->view->geometry;
 
+
 	DEBUG("Rendering to target { x: %d, y: %d, w: %u, h: %u }\n",
 	      target->view->geometry.x, target->view->geometry.y,
 	      target->view->geometry.width, target->view->geometry.height);
 
-	wld_set_target_surface(swc.drm->renderer, target->surface);
+  wld_set_target_surface(swc.backend->renderer, target->surface);
+
+  /*fprintf(stderr, // ΩΩ Shader Debug err
+        "target=%p\n",
+        swc.drm->renderer->target);*/
 
 	if (pixman_region32_not_empty(base_damage)) {
 		pixman_region32_translate(base_damage, -target->view->geometry.x,
 		                          -target->view->geometry.y);
-		wld_fill_region(swc.drm->renderer, DEFAULT_BG,
+
+		wld_fill_region(swc.backend->renderer, DEFAULT_BG,
 		                base_damage);
 	}
 
@@ -416,32 +589,47 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
 		}
 	}
 
-	draw_overlays(swc.drm->renderer, target_geom);
+	draw_overlays(swc.backend->renderer, target_geom);
 
-	wld_flush(swc.drm->renderer);
+	wld_flush(swc.backend->renderer);
+
+	//fprintf(stderr,
+  //      "renderer_repaint complete target=%p\n",
+  //      target->surface);
 }
 
 static int
 renderer_attach(struct compositor_view *view, struct wld_buffer *client_buffer)
 {
 	struct wld_buffer *buffer;
+	uint32_t proxy_width, proxy_height;
 	bool was_proxy = view->buffer != view->base.buffer;
 	bool needs_proxy =
-	    client_buffer && !(wld_capabilities(swc.drm->renderer, client_buffer) &
+	    client_buffer && !(wld_capabilities(swc.backend->renderer, client_buffer) &
 	                       WLD_CAPABILITY_READ);
-	bool resized = view->buffer && client_buffer &&
-	               (view->buffer->width != client_buffer->width ||
-	                view->buffer->height != client_buffer->height);
+	bool proxy_incompatible =
+	    view->buffer && client_buffer &&
+	    (view->buffer->format != client_buffer->format ||
+	     view->buffer->width < client_buffer->width ||
+	     view->buffer->height < client_buffer->height);
 
 	if (client_buffer) {
 		/* Create a proxy buffer if necessary (for example a hardware buffer
 		 * backing a SHM buffer). */
 		if (needs_proxy) {
-			if (!was_proxy || resized) {
+			if (!was_proxy || proxy_incompatible) {
 				DEBUG("Creating a proxy buffer\n");
+				proxy_width = client_buffer->width;
+				proxy_height = client_buffer->height;
+				if (proxy_width <= UINT32_MAX - 255) {
+					proxy_width = (proxy_width + 255) & ~255U;
+				}
+				if (proxy_height <= UINT32_MAX - 255) {
+					proxy_height = (proxy_height + 255) & ~255U;
+				}
 				buffer = wld_create_buffer(
-				    swc.drm->context, client_buffer->width,
-				    client_buffer->height, client_buffer->format, WLD_FLAG_MAP);
+				    swc.backend->context, proxy_width, proxy_height,
+				    client_buffer->format, WLD_FLAG_MAP);
 
 				if (!buffer) {
 					return -ENOMEM;
@@ -460,26 +648,81 @@ renderer_attach(struct compositor_view *view, struct wld_buffer *client_buffer)
 	/* If we no longer need a proxy buffer, or the original buffer is of a
 	 * different size, destroy the old proxy image. */
 	if (view->buffer &&
-	    ((!needs_proxy && was_proxy) || (needs_proxy && resized))) {
+	    ((!needs_proxy && was_proxy) ||
+	     (needs_proxy && was_proxy && proxy_incompatible))) {
 		wld_buffer_unreference(view->buffer);
 	}
 
 	view->buffer = buffer;
+	view->buffer_opaque_valid = false;
+
+  //fprintf(stderr,
+  //  "attach result: base=%p view=%p\n",
+  //  view->base.buffer,
+  //  view->buffer);
 
 	return 0;
 }
 
+
 static void
 renderer_flush_view(struct compositor_view *view)
 {
+  // initial check
+  //bool ok;
+
+  /* fprintf(stderr,
+          "buffer compare: view=%p base=%p same=%d ok=%d\n",
+          view->buffer,
+          view->base.buffer,
+          view->buffer && view->base.buffer &&
+          view->buffer == view->base.buffer); */
+
+	//ok = if (view->buffer == view->base.buffer) {
 	if (view->buffer == view->base.buffer) {
 		return;
-	}
+  }
 
-	wld_set_target_buffer(swc.shm->renderer, view->buffer);
-	wld_copy_region(swc.shm->renderer, view->base.buffer, 0, 0,
+  wld_set_target_buffer( swc.shm->renderer, view->buffer);
+
+   /*
+  // debug
+  fprintf(stderr,
+          "flush_view: target=%p renderer=%p ok=%d\n",
+          view->buffer,
+          swc.shm->renderer,
+          ok);
+
+  // debug
+  fprintf(stderr,
+        "flush_view: base=%p proxy=%p ok=%d\n",
+        view->base.buffer,
+        view->buffer,
+        ok);
+	fprintf(stderr,
+        "proxy: %dx%d format=%u\n",
+        view->buffer->width,
+        view->buffer->height,
+        view->buffer->format);
+  fprintf(stderr,
+        "base: %dx%d format=%u\n",
+        view->base.buffer->width,
+        view->base.buffer->height,
+        view->base.buffer->format);
+  */
+
+  // copy
+	wld_copy_region(swc.shm->renderer,
+	                view->base.buffer,
+	                0, 0,
 	                &view->surface->state.damage);
+
+  // debug
+  //fprintf(stderr, "copy_region done\n");
+
+  // flush
 	wld_flush(swc.shm->renderer);
+
 }
 
 /* }}} */
@@ -997,7 +1240,7 @@ move(struct view *base, int32_t x, int32_t y)
 		if (view->visible) {
 			/* Assume worst-case no clipping until we draw the next frame (in
 			 * case the surface gets moved again before that). */
-			pixman_region32_init(&view->clip);
+			pixman_region32_clear(&view->clip);
 
 			view_update_screens(&view->base);
 			damage_below_view(view);
@@ -1076,17 +1319,15 @@ view_at(int32_t x, int32_t y)
 
 		geom = &view->base.geometry;
 		if (view->window) {
-			if (!rectangle_contains_point(geom, x, y)) {
-				continue;
-			}
+      if (!rectangle_contains_point(geom, x, y)) continue;
+      if (!rectangle_on_any_screen(geom)) continue; // <-- Patch
 		} else if (view->base.buffer) {
 			buffer_geom.x = geom->x - view->buffer_offset_x;
 			buffer_geom.y = geom->y - view->buffer_offset_y;
 			buffer_geom.width = view->base.buffer->width;
 			buffer_geom.height = view->base.buffer->height;
-			if (!rectangle_contains_point(&buffer_geom, x, y)) {
-				continue;
-			}
+			if (!rectangle_contains_point(&buffer_geom, x, y)) continue;
+      if (!rectangle_on_any_screen(&buffer_geom)) continue;   // <-- Patch
 		} else if (!rectangle_contains_point(geom, x, y)) {
 			continue;
 		}
@@ -1095,6 +1336,10 @@ view_at(int32_t x, int32_t y)
 		                                   x - geom->x + view->buffer_offset_x,
 		                                   y - geom->y + view->buffer_offset_y,
 		                                   NULL)) {
+      //fprintf(stderr, "view_at hit: window=%p title=%s geom=(%d,%d %ux%u)\n",
+      //        (void*)view->window,
+      //       view->window && view->window->base.title ? view->window->base.title : "?",
+      //       geom->x, geom->y, geom->width, geom->height);
 			return view;
 		}
 	}
@@ -1105,7 +1350,8 @@ view_at(int32_t x, int32_t y)
 static struct compositor_view *
 window_view(struct compositor_view *view)
 {
-	while (view && !view->window && view->parent && view->parent != view) {
+	while (view && !view->window && view->parent && view->parent != view)
+	{
 		view = view->parent;
 	}
 	return (view && view->window) ? view : NULL;
@@ -1211,7 +1457,8 @@ view_for_window(struct swc_window *base)
 {
 	struct window *window;
 
-	if (!base) {
+	if (!base)
+	{
 		return NULL;
 	}
 
@@ -1277,6 +1524,14 @@ damage_views(struct compositor_view *a, struct compositor_view *b)
 	schedule_updates(screens);
 }
 
+
+EXPORT void
+swc_window_raise(struct swc_window *window)
+{
+  struct compositor_view *view = view_for_window(window);
+  raise_window(view);
+}
+
 EXPORT void
 swc_window_stack(struct swc_window *window, int32_t direction)
 {
@@ -1320,6 +1575,8 @@ compositor_create_view(struct surface *surface)
 	view_initialize(&view->base, &view_impl);
 	view->surface = surface;
 	view->buffer = NULL;
+	view->buffer_opaque_valid = false;
+	view->buffer_opaque = false;
 	view->window = NULL;
 	view->parent = NULL;
 	view->buffer_offset_x = 0;
@@ -1376,6 +1633,10 @@ compositor_view_set_parent(struct compositor_view *view,
                            struct compositor_view *parent)
 {
 	view->parent = parent;
+
+  if (!parent) {
+    return;
+  }
 
 	if (parent->visible) {
 		compositor_view_show(view);
@@ -1447,6 +1708,23 @@ compositor_view_show(struct compositor_view *view)
 	}
 }
 
+// Ω PATCH: change pointer focus on layer mapping state change
+void
+compositor_update_pointer_focus(void)
+{
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+
+	if (!pointer || pointer->buttons.size > 0) {
+		return;
+	}
+
+	int32_t x = wl_fixed_to_int(pointer->x);
+	int32_t y = wl_fixed_to_int(pointer->y);
+
+	pointer_set_focus(pointer, view_at(x, y));
+}
+// -----------------------
+
 void
 compositor_view_hide(struct compositor_view *view)
 {
@@ -1514,6 +1792,12 @@ void
 compositor_view_set_decor(struct compositor_view *view,
                             const struct swc_decor *decor)
 {
+	/* decor_view_set() could shrink or remove the decoration, so wedamage the old
+	 * extents before they are replaced */
+	if (view->visible) {
+		damage_below_view(view);
+	}
+
 	decor_view_set(view, decor);
 	update_extents(view);
 	update(&view->base);
@@ -1574,6 +1858,7 @@ calculate_damage(void)
 		surface_damage = &view->surface->state.damage;
 
 		if (pixman_region32_not_empty(surface_damage)) {
+			view->buffer_opaque_valid = false;
 			renderer_flush_view(view);
 
 			/* Translate surface damage to global coordinates. */
@@ -1652,11 +1937,10 @@ update_screen(struct screen *screen)
 
 		pixman_region32_t full;
 		pixman_region32_init_rect(&full, 0, 0, geom->width, geom->height);
-		wld_set_target_surface(swc.drm->renderer, target->surface);
-		wld_copy_region(swc.drm->renderer, zoomed, 0, 0, &full);
-		wld_flush(swc.drm->renderer);
+		wld_set_target_surface(swc.backend->renderer, target->surface);
+		wld_copy_region(swc.backend->renderer, zoomed, 0, 0, &full);
+		wld_flush(swc.backend->renderer);
 		pixman_region32_fini(&full);
-
 		wld_buffer_unreference(zoomed);
 	} else {
 		pixman_region32_t base_damage;
@@ -1739,8 +2023,8 @@ handle_button(struct pointer_handler *handler, uint32_t time,
 	int32_t y = wl_fixed_to_int(swc.seat->pointer->y);
 	struct compositor_view *view = view_at(x, y);
 
+	//raise_window(view); // BUGGY RAISE WINDOW
 	pointer_set_focus(swc.seat->pointer, view);
-	raise_window(view);
 
 	return false;
 }
@@ -1925,7 +2209,7 @@ compositor_render_to_shm(struct screen *screen)
 		return NULL;
 	}
 
-	/* set reigon */
+	/* set region */
 	pixman_region32_init_rect(&region, 0, 0, width, height);
 	pixman_region32_init_rect(&damage, screen->base.geometry.x,
 	                          screen->base.geometry.y, width, height);
@@ -1948,13 +2232,56 @@ compositor_render_to_shm(struct screen *screen)
 
 		if (src &&
 		    (wld_capabilities(swc.shm->renderer, src) & WLD_CAPABILITY_READ)) {
-			int32_t x = view->base.geometry.x - screen->base.geometry.x;
-			int32_t y = view->base.geometry.y - screen->base.geometry.y;
+      /* PSEUDOCODE, replace! !Ω! ...TODO
+      if (view_has_effect(view)) {
+          effects_apply(view);
+      }
 
-			wld_copy_rectangle(swc.shm->renderer, src, x, y, 0, 0,
-			                   view->base.geometry.width,
-			                   view->base.geometry.height);
+      ex
+      bool
+      view_has_effect(struct compositor_view *view)
+      {
+          return
+              pixman_region32_not_empty(&view->surface->state.blur)
+              || ...
+              ;
+      }
+      */
+
+			const struct swc_rectangle *geom = &view->base.geometry;
+			int32_t src_x = view->window ? view->buffer_offset_x : 0;
+			int32_t src_y = view->window ? view->buffer_offset_y : 0;
+			int32_t dst_x = geom->x - src_x - screen->base.geometry.x;
+			int32_t dst_y = geom->y - src_y - screen->base.geometry.y;
+			pixman_region32_t source_region;
+
+			pixman_region32_init_rect(&source_region, src_x, src_y, geom->width,
+			                          geom->height);
+			pixman_region32_intersect_rect(&source_region, &source_region, 0, 0,
+			                               src->width, src->height);
+			if (src->format == WLD_FORMAT_ARGB8888) {
+				wld_blend_region(swc.shm->renderer, src, dst_x, dst_y,
+				                 &source_region);
+			} else {
+				wld_copy_region(swc.shm->renderer, src, dst_x, dst_y,
+				                &source_region);
+			}
+			pixman_region32_fini(&source_region);
+
+      // ↓ init shader path,vreplace with above at some point
+      /* if (pixman_region32_not_empty(&view->surface->state.blur)) {
+          effects_apply(
+            swc.shm->renderer,
+            view->surface,
+            x,
+            y);
+      }*/
 		}
+
+    /* HRMRMMR?!
+    if (pixman_region32_not_empty(&view->surface->state.blur))
+      effect_debug_color(...);
+    */
 
 		if ((view->border.outwidth > 0 || view->border.inwidth > 0) &&
 		    view->base.buffer) {

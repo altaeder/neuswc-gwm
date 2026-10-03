@@ -279,11 +279,25 @@ swc_window_set_fullscreen(struct swc_window *base, struct swc_screen *screen)
 			window->impl->set_mode(window, WINDOW_MODE_FULLSCREEN);
 		}
 		window->mode = WINDOW_MODE_FULLSCREEN;
-	}
 
+		// -------- NEW ADDS -- FULLSCREEN DIM FIX ↓↓↓↓↓↓
+		if (window->impl->configure) {
+      window->impl->configure(window, screen->usable_geometry.width,
+                              screen->usable_geometry.height);
+    }
+    // -------- NEW ↑↑↑↑↑
+	}
 	else {
 		swc_window_set_geometry(base, &window->prev.geom);
 		window->mode = window->prev.mode;
+
+    // -------- NEW ↓↓↓↓↓
+    if (window->impl->configure) {
+      window->impl->configure(window, window->prev.geom.width,
+                              window->prev.geom.height);
+    }
+    // -------- NEW ----------------------- ↑↑↑↑↑↑
+
 	}
 }
 

@@ -308,10 +308,12 @@ create_pool(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 
 error2:
 	wl_resource_destroy(pool->resource);
+	free(pool); // New
 error1:
 	free(pool);
 error0:
 	close(fd);
+	free(pool); // New Ω
 }
 
 static const struct wl_shm_interface shm_impl = {.create_pool = &create_pool};

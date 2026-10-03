@@ -389,6 +389,8 @@ handle_attach(struct view_handler *handler)
 
 	surface->mapped = mapped;
 	update_usable_geometry(surface);
+	// Ω PATCH: update pointer on map state change
+	compositor_update_pointer_focus();
 }
 
 static void
@@ -484,6 +486,13 @@ destroy_layer_surface(struct wl_resource *resource)
 	wl_list_remove(&surface->surface_destroy_listener.link);
 	wl_list_remove(&surface->surface_commit_listener.link);
 	wl_list_remove(&surface->modifier.link);
+
+  // PATCH Ω: update pointer on mapping state change
+  if (surface->mapped) {
+		compositor_view_hide(surface->view);
+		compositor_update_pointer_focus();
+	}
+
 	compositor_view_destroy(surface->view);
 	if (had_screen) {
 		screen_update_usable_geometry(surface->screen);
@@ -529,7 +538,7 @@ layer_surface_new(struct wl_client *client, uint32_t version, uint32_t id,
 
 	layer_surface->screen = screen;
 	layer_surface->current.layer = layer;
-	layer_surface->pending = layer_surface->current;
+	//layer_surface->pending = layer_surface->current;
 	layer_surface->current.exclusive_zone = 0;
 	layer_surface->current.exclusive_edge = 0;
 	layer_surface->current.keyboard_interactivity =

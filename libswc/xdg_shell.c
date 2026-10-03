@@ -354,6 +354,10 @@ set_mode(struct window *window, unsigned mode)
 		break;
 	}
 
+  /* uint32_t width = window->view->base.geometry.width;
+     uint32_t height = window->view->base.geometry.height;
+     send_configure(toplevel, width ? (int32_t)width : -1, height ? (int32_t)height : -1);
+  */
 	send_configure(toplevel, -1, -1);
 }
 

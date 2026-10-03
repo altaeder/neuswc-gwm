@@ -41,7 +41,10 @@
 #include <unistd.h>
 #include <xkbcommon/xkbcommon.h>
 
-static const int repeat_delay = 500, repeat_rate = 40;
+//static const int repeat_delay = 500, repeat_rate = 40;
+__attribute__((visibility("default")))
+int32_t swc_repeat_rate = 40, swc_repeat_delay = 500;
+
 
 static void
 enter(struct input_focus_handler *handler,
@@ -283,7 +286,7 @@ error2:
 error1:
 	free(keyboard);
 error0:
-	return false;
+	return NULL;
 }
 
 void
@@ -384,7 +387,8 @@ keyboard_bind(struct keyboard *keyboard,
 
 	if (version >= 4) {
 		wl_keyboard_send_repeat_info(
-		    client_resource, repeat_rate, repeat_delay);
+		    //client_resource, repeat_rate, repeat_delay);
+		    client_resource, swc_repeat_rate, swc_repeat_delay);
 	}
 
 	return client_resource;

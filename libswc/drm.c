@@ -196,6 +196,9 @@ find_available_crtc(drmModeRes *resources, drmModeConnector *connector,
 
 	for (i = 0; i < connector->count_encoders; ++i) {
 		encoder = drmModeGetEncoder(swc.drm->fd, connector->encoders[i]);
+		if (!encoder) {
+      continue;
+		}
 		possible_crtcs = encoder->possible_crtcs;
 		drmModeFreeEncoder(encoder);
 
@@ -287,6 +290,9 @@ drm_initialize(void)
 		val = 64;
 	}
 	swc.drm->cursor_h = val;
+	swc.backend = &swc.drm->backend;
+	swc.backend->cursor_width = swc.drm->cursor_w;
+	swc.backend->cursor_height = swc.drm->cursor_h;
 
 	drm.path = drmGetRenderDeviceNameFromFd(swc.drm->fd);
 	if (!drm.path) {
@@ -304,6 +310,9 @@ drm_initialize(void)
 		goto error2;
 	}
 
+	swc.backend->context = swc.drm->context;
+	swc.backend->renderer = swc.drm->renderer;
+
 	drm.event_source = wl_event_loop_add_fd(
 	    swc.event_loop, swc.drm->fd, WL_EVENT_READABLE, &handle_data, NULL);
 
@@ -313,18 +322,18 @@ drm_initialize(void)
 	}
 
 	if (!wld_drm_is_dumb(swc.drm->context)) {
-		drm.global = wl_global_create(swc.display, &wl_drm_interface, 2, NULL,
-		                              &bind_drm);
-		if (!drm.global) {
-			ERROR("Could not create wl_drm global\n");
-			goto error4;
-		}
+	    drm.global = wl_global_create(swc.display, &wl_drm_interface, 2, NULL,
+	                                  &bind_drm);
+      if (!drm.global) {
+        ERROR("Could not create wl_drm global\n");
+        goto error4;
+      }
 
-		drm.dmabuf = swc_dmabuf_create(swc.display);
-		if (!drm.dmabuf) {
-			WARNING("Could not create wp_linux_dmabuf global\n");
-		}
-	}
+      drm.dmabuf = swc_dmabuf_create(swc.display);
+      if (!drm.dmabuf) {
+        WARNING("Could not create wp_linux_dmabuf global\n");
+      }
+    }
 
 	return true;
 
@@ -380,6 +389,11 @@ drm_create_screens(struct wl_list *screens)
 
 	resources = drmModeGetResources(swc.drm->fd);
 	if (!resources) {
+		// Maybe sus add:
+    struct plane *p, *ptmp;
+
+		wl_list_for_each_safe(p, ptmp, &planes, link)
+			plane_destroy(p);
 		ERROR("Could not get DRM resources\n");
 		return false;
 	}

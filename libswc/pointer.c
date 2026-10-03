@@ -22,16 +22,22 @@
  */
 
 #include "pointer.h"
+#include "backend.h"
 #include "compositor.h"
 #include "cursor/cursor_data.h"
 #include "event.h"
 #include "internal.h"
+
+#ifdef ENABLE_DRM
 #include "plane.h"
+#endif
+
 #include "screen.h"
 #include "seat.h"
 #include "shm.h"
 #include "surface.h"
 #include "util.h"
+#include "window.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -40,6 +46,8 @@
 
 static enum swc_cursor_kind cursor_override = SWC_CURSOR_DEFAULT;
 static enum swc_cursor_mode cursor_mode = SWC_CURSOR_MODE_CLIENT;
+// PATCH Ω: pointer null handling
+static void apply_cursor_override(struct pointer *pointer);
 
 static struct {
 	const uint32_t *data;
@@ -59,7 +67,7 @@ swc_pointer_send_button(uint32_t time, uint32_t button, uint32_t state)
 		return;
 	}
 
-	serial = wl_display_next_serial(swc.display);
+	serial = wl_display_next_serial(swc.display); // Ω ?????!!!!!
 	wl_resource_for_each(resource, &pointer->focus.active)
 	    wl_pointer_send_button(resource, serial, time, button, state);
 	wl_resource_for_each(resource, &pointer->focus.active)
@@ -131,6 +139,9 @@ enter(struct input_focus_handler *handler, struct wl_list *resources,
 		pointer_set_cursor(pointer, cursor_left_ptr);
 		return;
 	}
+  // PATCH Ω: pointer null handling
+  apply_cursor_override(pointer);
+
 	serial = wl_display_next_serial(swc.display);
 	/* do based on buffer origin, holy fuck */
 	origin_x = view->base.geometry.x - view->buffer_offset_x;
@@ -175,7 +186,9 @@ attach(struct view *view, struct wld_buffer *buffer)
 {
 	struct pointer *pointer = wl_container_of(view, pointer, cursor.view);
 	struct surface *surface = pointer->cursor.surface;
-	struct screen *screen;
+#ifdef ENABLE_DRM
+  struct screen *screen;
+#endif
 
 	if (surface && !pixman_region32_not_empty(&surface->state.damage)) {
 		return 0;
@@ -203,12 +216,16 @@ attach(struct view *view, struct wld_buffer *buffer)
 		view_update_screens(view);
 	}
 
-	wl_list_for_each(screen, &swc.screens, link)
+#ifdef ENABLE_DRM
+  wl_list_for_each(screen, &swc.screens, link)
 	{
 		view_attach(&screen->planes.cursor->view,
 		            buffer ? pointer->cursor.buffer : NULL);
 		view_update(&screen->planes.cursor->view);
 	}
+#else
+  compositor_damage_all();
+#endif
 
 	return 0;
 }
@@ -216,19 +233,24 @@ attach(struct view *view, struct wld_buffer *buffer)
 static bool
 move(struct view *view, int32_t x, int32_t y)
 {
+#ifdef ENABLE_DRM
 	struct screen *screen;
+#endif
 
 	if (view_set_position(view, x, y)) {
 		view_update_screens(view);
 	}
 
+#ifdef ENABLE_DRM
 	wl_list_for_each(screen, &swc.screens, link)
 	{
 		view_move(&screen->planes.cursor->view, view->geometry.x,
 		          view->geometry.y);
 		view_update(&screen->planes.cursor->view);
 	}
-
+#else
+	compositor_damage_all();
+#endif
 	return true;
 }
 
@@ -332,6 +354,13 @@ swc_clear_cursor_image(enum swc_cursor_kind kind)
 	cursor_images[kind].data = NULL;
 
 	apply_cursor_override(pointer);
+}
+
+EXPORT void
+swc_pointer_set_focus_window(struct swc_window *base)
+{
+  struct window *w = (struct window *)base;
+  pointer_set_focus(swc.seat->pointer, w ? w->view : NULL);
 }
 
 void
@@ -491,7 +520,7 @@ pointer_initialize(struct pointer *pointer)
 	struct swc_rectangle *geom = &screen->base.geometry;
 
 	/* Center cursor in the geometry of the first screen. */
-	screen = wl_container_of(swc.screens.next, screen, link);
+	// screen = wl_container_of(swc.screens.next, screen, link);
 	pointer->x = wl_fixed_from_int(geom->x + geom->width / 2);
 	pointer->y = wl_fixed_from_int(geom->y + geom->height / 2);
 	pointer->focus_handler.enter = enter;
@@ -510,7 +539,7 @@ pointer_initialize(struct pointer *pointer)
 	pointer->cursor.surface = NULL;
 	pointer->cursor.destroy_listener.notify = &handle_cursor_surface_destroy;
 	pointer->cursor.buffer = wld_create_buffer(
-	    swc.drm->context, swc.drm->cursor_w, swc.drm->cursor_h,
+	    swc.backend->context, swc.backend->cursor_width, swc.backend->cursor_height,
 	    WLD_FORMAT_ARGB8888, WLD_FLAG_MAP | WLD_FLAG_CURSOR);
 	pointer->cursor.internal_buffer = NULL;
 
@@ -520,8 +549,11 @@ pointer_initialize(struct pointer *pointer)
 
 	pointer_set_cursor(pointer, cursor_left_ptr);
 
-	wl_list_for_each(screen, &swc.screens, link)
-	    view_attach(&screen->planes.cursor->view, pointer->cursor.buffer);
+#ifdef ENABLE_DRM
+    wl_list_for_each(screen, &swc.screens, link)
+      if (screen->planes.cursor)
+        view_attach(&screen->planes.cursor->view, pointer->cursor.buffer);
+#endif
 
 	input_focus_initialize(&pointer->focus, &pointer->focus_handler);
 	pixman_region32_init(&pointer->region);
@@ -592,6 +624,17 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
+  // PATCH Ω: pointer null handling
+	if (!surface_resource) {
+		if (pointer->cursor.surface) {
+			surface_set_view(pointer->cursor.surface, NULL);
+			wl_list_remove(&pointer->cursor.destroy_listener.link);
+			pointer->cursor.surface = NULL;
+		}
+		view_attach(&pointer->cursor.view, NULL);
+		return;
+	}
+
 	/* If forcing compositor cursor, ignore client cursor surfaces. */
 	if (cursor_mode == SWC_CURSOR_MODE_COMPOSITOR ||
 	    cursor_override != SWC_CURSOR_DEFAULT) {
@@ -603,18 +646,24 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 		wl_list_remove(&pointer->cursor.destroy_listener.link);
 	}
 
-	surface =
-	    surface_resource ? wl_resource_get_user_data(surface_resource) : NULL;
+  // PATCH Ω: pointer null handling
+	//surface =
+  //    surface_resource ? wl_resource_get_user_data(surface_resource) : NULL;
+	surface = wl_resource_get_user_data(surface_resource);
 	pointer->cursor.surface = surface;
 	pointer->cursor.hotspot.x = hotspot_x;
 	pointer->cursor.hotspot.y = hotspot_y;
 
-	if (surface) {
+	/*if (surface) { Ω
 		surface_set_view(surface, &pointer->cursor.view);
 		wl_resource_add_destroy_listener(surface->resource,
 		                                 &pointer->cursor.destroy_listener);
 		update_cursor(pointer);
-	}
+	} */
+	surface_set_view(surface, &pointer->cursor.view);
+	wl_resource_add_destroy_listener(surface->resource,
+	                                 &pointer->cursor.destroy_listener);
+	update_cursor(pointer);
 }
 
 static const struct wl_pointer_interface pointer_impl = {

@@ -3,6 +3,7 @@ fs = import('fs')
 # Allow easy lookup for protocol for utility applications
 protos = {}
 foreach proto : [
+  'ext-background-effect-v1.xml',
   'server-decoration.xml',
   'swc.xml',
   'swc_snap.xml',

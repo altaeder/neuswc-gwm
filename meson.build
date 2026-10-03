@@ -28,17 +28,61 @@ add_project_arguments(cc.get_supported_arguments([
 ], language: 'c')
 
 requires = [
-  dependency('wayland-server', version: '>=1.6.0'),
+  dependency('wayland-server', version: '>=1.8.0'),
 ]
 requires_private = [
-  dependency('libdrm'),
   dependency('pixman-1'),
   dependency('wayland-protocols'),
   dependency('wld'),
   dependency('xkbcommon'),
 ]
 
-xwayland = dependency('xwayland', required: get_option('xwayland'))
+video_backend = get_option('video')
+framebuffer_backend = get_option('fb')
+drm = disabler()
+if video_backend == 'drm'
+  if framebuffer_backend != 'auto'
+    error('-Dfb applies only when -Dvideo=fb')
+  endif
+  drm = dependency('libdrm')
+  requires_private += drm
+  add_project_arguments('-DENABLE_DRM=1', language: 'c')
+elif video_backend == 'fb'
+  if framebuffer_backend == 'auto'
+    if os == 'linux'
+      framebuffer_backend = 'fbdev'
+    elif os == 'netbsd' or os == 'openbsd'
+      framebuffer_backend = 'wsdisplay'
+    else
+      error('Failed to determine framebuffer interface for ' + os)
+    endif
+  endif
+
+  if framebuffer_backend == 'fbdev'
+    if os != 'linux'
+      error('The fbdev framebuffer interface is supported only on Linux')
+    endif
+    add_project_arguments([
+      '-DENABLE_FBDEV=1',
+      '-DFBDEV_DEVICE="@0@"'.format(get_option('fbdev-device')),
+    ], language: 'c')
+  elif framebuffer_backend == 'wsdisplay'
+    if os != 'netbsd' and os != 'openbsd'
+      error('The wsdisplay framebuffer interface is supported only on NetBSD and OpenBSD')
+    endif
+    add_project_arguments([
+      '-DENABLE_WSDISPLAY=1',
+      '-DWSDISPLAY_DEVICE="@0@"'.format(get_option('wsdisplay-device')),
+    ], language: 'c')
+  endif
+endif
+
+if video_backend != 'drm' and get_option('xwayland').enabled()
+  error('Xwayland requires the DRM video backend')
+endif
+xwayland = video_backend == 'drm' \
+  ? dependency('xwayland', required: get_option('xwayland')) \
+  : disabler()
 xwayland_deps = [
   'xcb',
   'xcb-composite',
@@ -58,13 +102,16 @@ libinput = dependency('libinput', version: '>=0.4', required: input_backend == '
 
 if input_backend == 'auto'
   if os == 'linux'
-    input_backend = libinput.found() ? 'libinput' : 'evdev'
-  elif os == 'netbsd'
+    if not libinput.found()
+      error('libinput is required for the linux input backend')
+    endif
+    input_backend = 'libinput'
+  elif os == 'netbsd' or os == 'openbsd'
     input_backend = 'wscons'
   else
     error('Failed to determine input backend for ' + os)
   endif
-endif  
+endif
 
 if input_backend == 'libinput'
   udev = dependency('libudev', required: get_option('udev'))
@@ -72,11 +119,6 @@ if input_backend == 'libinput'
     add_project_arguments('-DENABLE_LIBUDEV', language: 'c')
   endif
   requires_private += [libinput, udev]
-elif input_backend == 'evdev'
-  add_project_arguments([
-    '-DEVDEV_KBD_DEVICE="@0@"'.format(get_option('evdev-keyboard')),
-    '-DEVDEV_POINTER_DEVICE="@0@"'.format(get_option('evdev-pointer')),
-  ], language: 'c')
 endif
 
 subdir('protocol')
@@ -95,4 +137,6 @@ endif
 summary({
   'Xwayland support': xwayland.found(),
   'Input backend': input_backend,
+  'Video backend': video_backend,
+  'Framebuffer interface': video_backend == 'fb' ? framebuffer_backend : 'n/a',
 }, bool_yn: true)

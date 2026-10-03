@@ -69,6 +69,7 @@ state_initialize(struct surface_state *state)
 
 	pixman_region32_init(&state->damage);
 	pixman_region32_init(&state->opaque);
+	pixman_region32_init(&state->blur); // NEW, Blur
 	pixman_region32_init_with_extents(&state->input, &infinite_extents);
 
 	wl_list_init(&state->frame_callbacks);
@@ -88,6 +89,7 @@ state_finalize(struct surface_state *state)
 	pixman_region32_fini(&state->damage);
 	pixman_region32_fini(&state->opaque);
 	pixman_region32_fini(&state->input);
+	pixman_region32_fini(&state->blur); // NEW, Blur
 
 	/* Remove all leftover callbacks. */
 	wl_list_for_each_safe(resource, tmp, &state->frame_callbacks, link)
@@ -213,7 +215,8 @@ frame(struct wl_client *client, struct wl_resource *resource, uint32_t id)
 }
 
 static void
-set_opaque_region(struct wl_client *client, struct wl_resource *resource,
+set_opaque_region(struct wl_client *client,
+                  struct wl_resource *resource,
                   struct wl_resource *region_resource)
 {
 	struct surface *surface = wl_resource_get_user_data(resource);
@@ -282,6 +285,16 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 		pixman_region32_copy(&surface->state.opaque,
 		                     &surface->pending.state.opaque);
 	}
+
+	/* ###################################
+	############ !Ω! -Blur- !Ω! ######
+	#######################################
+	*/
+  if (surface->pending.commit & SURFACE_COMMIT_BLUR) {
+    pixman_region32_copy(
+      &surface->state.blur,
+      &surface->pending.state.blur);
+  }
 
 	/* Input */
 	if (surface->pending.commit & SURFACE_COMMIT_INPUT) {

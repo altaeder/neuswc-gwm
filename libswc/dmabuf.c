@@ -27,6 +27,14 @@
 #include "util.h"
 #include "wayland_buffer.h"
 
+// Ω updated mesa impl
+#include <fcntl.h>
+#include <linux/memfd.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/syscall.h>
+// Ω updated mesa impl
+
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include <drm_fourcc.h>
 #include <stdint.h>
@@ -199,9 +207,185 @@ error0:
 	wl_resource_post_no_memory(resource);
 }
 
+// Ω updated mesa impl
+static void
+feedback_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+  wl_resource_destroy(resource);
+}
+
+static const struct zwp_linux_dmabuf_feedback_v1_interface feedback_impl =
+  { .destroy = feedback_destroy, };
+
+static bool
+send_default_feedback(struct wl_resource *resource)
+{
+  static const struct
+  {
+    uint32_t format;
+    uint32_t padding;
+    uint64_t modifier;
+  }
+  formats[] =
+  {
+    {
+      .format = DRM_FORMAT_XRGB8888,
+      .modifier = DRM_FORMAT_MOD_LINEAR,
+    },
+    {
+      .format = DRM_FORMAT_ARGB8888,
+      .modifier = DRM_FORMAT_MOD_LINEAR,
+    },
+  };
+
+  struct stat st;
+  uint64_t device;
+  struct wl_array main_device = { 0 };
+  struct wl_array tranche_device = { 0 };
+  struct wl_array tranche_formats = { 0 };
+  int fd;
+  ssize_t size;
+
+  if (fstat(swc.drm->fd, &st) < 0 )
+  {
+    ERROR("Could not stat DRM device fd '%d'\n", swc.drm->fd);
+    return false;
+  }
+
+	/*
+	 * linux-dmabuf feedback expects the device as a dev_t,
+	 * represented as an 8-byte array.
+	 */
+
+  device = (uint64_t)makedev(major(st.st_rdev), minor(st.st_rdev));
+
+  fd = syscall(SYS_memfd_create, "swc-dmabuf-feedback", MFD_CLOEXEC);
+  if (fd < 0)
+  {
+    ERROR("Could not create dmabuf feedback format table\n");
+    return false;
+  }
+
+  size = write(fd, formats, sizeof(formats));
+  if (size != (ssize_t)sizeof(formats))
+  {
+    ERROR("Could not write dmabuf feedback format table\n");
+    close(fd);
+    return false;
+  }
+
+  if (wl_array_add(&main_device, sizeof(device)) == NULL ||
+      wl_array_add(&tranche_device, sizeof(device)) == NULL ||
+      wl_array_add(&tranche_formats, 2 * sizeof(uint16_t)) == NULL)
+  {
+		ERROR("Could not allocate dmabuf feedback arrays\n");
+		close(fd);
+		wl_array_release(&main_device);
+		wl_array_release(&tranche_device);
+		wl_array_release(&tranche_formats);
+		return false;
+	}
+
+	memcpy(main_device.data, &device, sizeof(device));
+	memcpy(tranche_device.data, &device, sizeof(device));
+
+	{
+	  uint16_t *indices = tranche_formats.data;
+
+	  indices[0] = 0;
+	  indices[1] = 1;
+	}
+
+	/*
+	 * The format table describes:
+	 *
+	 *   index 0 = XRGB8888 + LINEAR
+	 *   index 1 = ARGB8888 + LINEAR
+	 *
+	 * The same render node is both the main device and the
+	 * target device for our single tranche.
+	 */
+  zwp_linux_dmabuf_feedback_v1_send_format_table(
+    resource, fd, sizeof(formats));
+
+  zwp_linux_dmabuf_feedback_v1_send_main_device(
+    resource, &main_device);
+
+  zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(
+    resource, &tranche_device);
+
+  zwp_linux_dmabuf_feedback_v1_send_tranche_formats(
+    resource, &tranche_formats);
+
+  zwp_linux_dmabuf_feedback_v1_send_tranche_flags(
+    resource, 0);
+
+  zwp_linux_dmabuf_feedback_v1_send_tranche_done(resource);
+  zwp_linux_dmabuf_feedback_v1_send_done(resource);
+
+  close(fd);
+
+  wl_array_release(&main_device);
+  wl_array_release(&tranche_device);
+  wl_array_release(&tranche_formats);
+
+  return true;
+}
+
+static void
+get_default_feedback(struct wl_client *client,
+                     struct wl_resource *resource,
+                     uint32_t id)
+{
+  struct wl_resource *feedback;
+
+  feedback = wl_resource_create(
+    client,
+    &zwp_linux_dmabuf_feedback_v1_interface,
+    wl_resource_get_version(resource),
+    id);
+
+  if (!feedback)
+  {
+    wl_client_post_no_memory(client);
+    return;
+  }
+
+  wl_resource_set_implementation(
+    feedback,
+    &feedback_impl,
+    NULL,
+    NULL);
+
+  if(!send_default_feedback(feedback))
+  {
+    wl_resource_destroy(feedback);
+  }
+}
+
+static void
+get_surface_feedback(struct wl_client *client,
+                     struct wl_resource *resource,
+                     uint32_t id,
+                     struct wl_resource *surface)
+{
+	/*
+	 * Stage 1: we currently have the same dmabuf capabilities
+	 * for every surface, so use the default feedback.
+	 *
+	 * Surface-specific feedback can be implemented later.
+	 */
+
+  get_default_feedback(client, resource, id);
+}
+
+// Ω updated mesa impl
+
 static const struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
     .destroy = destroy_resource,
     .create_params = create_params,
+    .get_default_feedback = get_default_feedback, // Ω updated mesa impl
+	  .get_surface_feedback = get_surface_feedback, // Ω
 };
 
 static void
@@ -211,7 +395,8 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	    DRM_FORMAT_XRGB8888,
 	    DRM_FORMAT_ARGB8888,
 	};
-	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+	/*it appears we can only handle linear*/
+	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
 	struct wl_resource *resource;
 	size_t i;
 
@@ -224,7 +409,6 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	wl_resource_set_implementation(resource, &dmabuf_impl, NULL, NULL);
 	for (i = 0; i < ARRAY_LENGTH(formats); ++i) {
 		if (version >= 3) {
-			/* TODO: need a way to query DRM modifiers of wld */
 			zwp_linux_dmabuf_v1_send_modifier(
 			    resource, formats[i], modifier >> 32, modifier & 0xffffffff);
 		} else {
@@ -236,6 +420,7 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 struct wl_global *
 swc_dmabuf_create(struct wl_display *display)
 {
-	return wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 3, NULL,
+	return wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 4, NULL,
 	                        &bind_dmabuf);
 }
+// Ω above changed from 3 -> 4, mesa update impl.

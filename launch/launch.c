@@ -37,6 +37,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <stdnoreturn.h>
 #include <string.h>
 #include <unistd.h>
@@ -47,7 +48,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #ifdef __linux__
-#include <sys/sysmacros.h>
+  #include <sys/sysmacros.h>
 #endif
 
 #if defined(__FreeBSD__)
@@ -69,7 +70,9 @@
 #include <dev/wscons/wsdisplay_usl_io.h>
 #endif
 
+#ifdef ENABLE_DRM
 #include <xf86drm.h>
+#endif
 
 #define ARRAY_LENGTH(array) (sizeof(array) / sizeof(array)[0])
 
@@ -81,7 +84,9 @@ deactivate(void);
 static bool nflag;
 static int sigfd[2], sock[2];
 static int input_fds[128], num_input_fds;
+#ifdef ENABLE_DRM
 static int drm_fds[16], num_drm_fds;
+#endif
 static int tty_fd;
 static bool active;
 
@@ -123,6 +128,7 @@ die(const char *format, ...)
 static void
 start_devices(void)
 {
+#ifdef ENABLE_DRM
 	int i;
 
 	for (i = 0; i < num_drm_fds; ++i) {
@@ -130,6 +136,7 @@ start_devices(void)
 			die("failed to set DRM master");
 		}
 	}
+#endif
 }
 
 static void
@@ -137,11 +144,13 @@ stop_devices(bool fatal)
 {
 	int i;
 
+#ifdef ENABLE_DRM
 	for (i = 0; i < num_drm_fds; ++i) {
 		if (drmDropMaster(drm_fds[i]) < 0 && fatal) {
 			die("drmDropMaster:");
 		}
 	}
+#endif
 	for (i = 0; i < num_input_fds; ++i) {
 #ifdef EVIOCREVOKE
 		if (ioctl(input_fds[i], EVIOCREVOKE, 0) < 0 && errno != ENODEV &&
@@ -278,13 +287,30 @@ handle_socket_data(int socket)
 			#endif
 			input_fds[num_input_fds++] = fd;
 		} else if (device_is_drm(st.st_rdev)) {
+#ifdef ENABLE_DRM
 			if (num_drm_fds == ARRAY_LENGTH(drm_fds)) {
 				fprintf(stderr, "too many DRM devices opened\n");
 				goto fail;
 			}
 			drm_fds[num_drm_fds++] = fd;
+#else
+			fprintf(stderr, "DRM device requested by non-DRM backend\n");
+			goto fail;
+#endif
+#ifdef ENABLE_FBDEV
+		} else if (device_is_fbdev(st.st_rdev)) {
+			if (!active) {
+				goto fail;
+			}
+#endif
+#ifdef ENABLE_WSDISPLAY
+		} else if (device_is_tty(st.st_rdev)) {
+			if (!active) {
+				goto fail;
+			}
+#endif
 		} else {
-			fprintf(stderr, "requested fd is not a DRM or input device\n");
+			fprintf(stderr, "requested fd is not a video or input device\n");
 			goto fail;
 		}
 		break;
@@ -356,7 +382,6 @@ find_vt(char *vt, size_t size)
 		if (snprintf(vt, size, "/dev/ttyv%d", vt_num - 1) >= size) {
 		#else
 		if (snprintf(vt, size, "/dev/tty%d", vt_num) >= size) {
-		
 		#endif
 		  			die("VT number is too large");
 		}
@@ -626,6 +651,9 @@ main(int argc, char *argv[])
 	fprintf(stderr, "running on %s\n", vt);
 	tty_fd = open_tty(vt);
 	setup_tty(tty_fd);
+	if (setenv(SWC_LAUNCH_TTY_ENV, vt, 1) == -1) {
+		die("setenv %s:", SWC_LAUNCH_TTY_ENV);
+	}
 
 	sprintf(buf, "%d", sock[1]);
 	setenv(SWC_LAUNCH_SOCKET_ENV, buf, 1);

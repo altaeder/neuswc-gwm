@@ -21,6 +21,8 @@
  * SOFTWARE.
  */
 
+/* #include <stdint.h> */
+
 #ifndef SWC_SEAT_H
 #define SWC_SEAT_H
 

@@ -25,7 +25,13 @@
 #include "bindings.h"
 #include "compositor.h"
 #include "data_device_manager.h"
+
+#ifdef ENABLE_DRM
 #include "drm.h"
+#else
+#include "fb.h"
+#endif
+
 #include "event.h"
 #include "internal.h"
 #include "kde_decoration.h"
@@ -46,6 +52,9 @@
 #include "xdg_decoration.h"
 #include "xdg_output.h"
 #include "xdg_shell.h"
+
+#include "background_effect_manager.h"
+
 #ifdef ENABLE_XWAYLAND
 #include "xserver.h"
 #endif
@@ -53,9 +62,13 @@
 extern struct swc_launch swc_launch;
 extern const struct swc_bindings swc_bindings;
 extern struct swc_compositor swc_compositor;
+
+#ifdef ENABLE_DRM
 extern struct swc_drm swc_drm;
+#endif
+
 #ifdef ENABLE_XWAYLAND
-extern struct swc_xserver swc_xserver;
+  extern struct swc_xserver swc_xserver;
 #endif
 
 extern struct pointer_handler screens_pointer_handler;
@@ -63,10 +76,12 @@ extern struct pointer_handler screens_pointer_handler;
 struct swc swc = {
     .bindings = &swc_bindings,
     .compositor = &swc_compositor,
+#ifdef ENABLE_DRM
     .drm = &swc_drm,
-#ifdef ENABLE_XWAYLAND
-    .xserver = &swc_xserver,
 #endif
+    #ifdef ENABLE_XWAYLAND
+      .xserver = &swc_xserver,
+    #endif
 };
 
 static void
@@ -121,6 +136,20 @@ swc_deactivate(void)
 }
 
 EXPORT bool
+swc_cursor_set_position(int32_t x, int32_t y)
+{
+	if (!swc.seat || !swc.seat->pointer) {
+		return false;
+	}
+
+	pointer_handle_absolute_motion(swc.seat->pointer, get_time(),
+	                               wl_fixed_from_int(x), wl_fixed_from_int(y));
+	pointer_handle_frame(swc.seat->pointer);
+
+	return true;
+}
+
+EXPORT bool
 swc_cursor_position(int32_t *x, int32_t *y)
 {
 	if (x) {
@@ -160,10 +189,16 @@ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
 		goto error0;
 	}
 
-	if (!drm_initialize()) {
-		ERROR("Could not initialize DRM\n");
-		goto error1;
-	}
+	if (!
+#ifdef ENABLE_DRM
+	    drm_initialize()
+#else
+	    fb_initialize()
+#endif
+	) {
+		ERROR("Could not initialize video backend\n");
+    goto error1;
+  }
 
 	swc.shm = shm_create(display);
 	if (!swc.shm) {
@@ -265,10 +300,19 @@ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
 		goto error17;
 	}
 
+  // SHADER HANDLER
+  swc.background_effect_manager = background_effect_create(display);
+  if (!swc.background_effect_manager) {
+      ERROR("Could not initialize background effect manager\n");
+      goto error18;
+  }
+
 	setup_compositor();
 
 	return true;
 
+error18:
+  wl_global_destroy(swc.background_effect_manager);
 error17:
 	wl_global_destroy(swc.select_manager);
 #ifdef ENABLE_XWAYLAND
@@ -302,7 +346,11 @@ error4:
 error3:
 	shm_destroy(swc.shm);
 error2:
-	drm_finalize();
+#ifdef ENABLE_DRM
+  drm_finalize();
+#else
+	fb_finalize();
+#endif
 error1:
 	launch_finalize();
 error0:
@@ -329,6 +377,10 @@ swc_finalize(void)
 	screens_finalize();
 	bindings_finalize();
 	shm_destroy(swc.shm);
+#ifdef ENABLE_DRM
 	drm_finalize();
+#else
+	fb_finalize();
+#endif
 	launch_finalize();
 }

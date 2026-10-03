@@ -7,8 +7,6 @@ libswc_src = files(
   'data_device.c',
   'data_device_manager.c',
   'decor.c',
-  'dmabuf.c',
-  'drm.c',
   'input.c',
   'kde_decoration.c',
   'keyboard.c',
@@ -18,7 +16,6 @@ libswc_src = files(
   'output.c',
   'panel.c',
   'panel_manager.c',
-  'plane.c',
   'pointer.c',
   'primary_plane.c',
   'region.c',
@@ -40,11 +37,23 @@ libswc_src = files(
   'xdg_output.c',
   'xdg_shell.c',
 
+  # Shader package
+  'background_effect_manager.c',
+  'effects/effects.c',
+  'effects/debug.c',
+  'effects/blur_box.c',
+  'effects/blur_hvpass.c',
+  'effects/blur_hvpass_slide.c',
+
   input_backend == 'libinput' ? 'seat.c' : [],
   input_backend == 'wscons' ? 'seat-ws.c' : [],
-  input_backend == 'evdev' ? 'seat-evdev.c' : [],
+  ##input_backend == 'evdev' ? 'seat-evdev.c' : [],
 
-  xwayland.found() ? ['xserver.c', 'xwm.c'] : [],  
+  xwayland.found() ? ['xserver.c', 'xwm.c'] : [],
+
+  video_backend == 'drm' ? ['dmabuf.c', 'drm.c', 'plane.c'] : [],
+  framebuffer_backend == 'fbdev' ? ['fb.c', 'fb_fbdev.c'] : [],
+  framebuffer_backend == 'wsdisplay' ? ['fb.c', 'fb_wsdisplay.c'] : [],
 )
 libswc_src += [cursor, launch_protocol]
 

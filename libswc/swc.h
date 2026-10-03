@@ -45,8 +45,27 @@ struct wld_buffer;
  * wayland headers.
  *
  */
+
 bool
 swc_cursor_position(int32_t *x, int32_t *y);
+
+/**
+ * Set the cursor position.
+ *
+ * The coordinates are in compositor-global space, exposed as raw int32_t
+ * to avoid needing wayland headers. This has the same effect as the
+ * cursor being moved there by an input device.
+ */
+
+bool
+swc_cursor_set_position(int32_t x, int32_t y);
+
+/**
+
+ * Force pointer focus to a specific window, overriding swc's internal
+ * geometry-based hit-test. Intended for window managers (like hevel) that
+ * do their own, more correct hit-testing (e.g. respecting off-screen state).
+ */
 
 /**
  * Send a pointer button event to the currently focused client.
@@ -84,6 +103,34 @@ enum swc_cursor_mode {
 	/* Force compositor cursor; ignore client wl_pointer.set_cursor. */
 	SWC_CURSOR_MODE_COMPOSITOR = 1,
 };
+
+                  /* multi-touch */
+enum swc_gesture_phase {
+	SWC_GESTURE_BEGIN,
+	SWC_GESTURE_UPDATE,
+	SWC_GESTURE_END,
+};
+
+typedef void (*swc_gesture_handler)(void *data, uint32_t time,
+                                    uint32_t finger_count,
+                                    enum swc_gesture_phase phase,
+                                    double dx, double dy);
+
+/**
+ * Register a handler for touchpad swipe gestures.
+ *
+ * BEGIN fires once when fingers touch down, UPDATE fires repeatedly with
+ * incremental dx/dy deltas as fingers move, END fires once on lift-off or
+ * cancellation. dx/dy are only meaningful on UPDATE.
+ *
+ * Only one handler may be registered at a time; a later call replaces
+ * the previous one.
+ */
+void
+swc_set_gesture_handler(swc_gesture_handler handler, void *data);
+
+                  /* multi-touch */
+
 
 /**
  * Override the compositor's internal cursor.
@@ -271,6 +318,9 @@ struct swc_window {
 	uint32_t max_height;
 };
 
+void
+swc_pointer_set_focus_window(struct swc_window *window);
+
 /**
  * Set the handler associated with this window.
  */
@@ -447,7 +497,8 @@ struct swc_decor_text {
  * swc copies the pixel data when swc_window_set_decor() is called, so caller
  * doesn't need to keep it after the call returns.
  *
- * Pixel data is expected to be ARGB8888 with the provided stride.
+ * Pixel data is expected to be premultiplied ARGB8888 with the provided
+ * stride.
  */
 struct swc_decor_part {
 	uint32_t width, height;
@@ -549,7 +600,12 @@ swc_window_at(int32_t x, int32_t y);
 void
 swc_window_stack(struct swc_window *window, int32_t direction);
 
+void
+swc_window_raise(struct swc_window *window);
+
 /* }}} */
+
+extern int32_t swc_repeat_rate, swc_repeat_delay;
 
 /* Bindings {{{ */
 

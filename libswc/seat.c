@@ -77,6 +77,19 @@ struct seat {
 	struct wl_list resources;
 };
 
+/* multi-touch */
+static swc_gesture_handler gesture_handler = NULL;
+static void *gesture_handler_data = NULL;
+
+EXPORT void
+swc_set_gesture_handler(swc_gesture_handler handler, void *data)
+{
+  gesture_handler = handler;
+  gesture_handler_data = data;
+}
+
+/* ^^ multi-touch */
+
 static void
 handle_keyboard_focus_event(struct wl_listener *listener, void *data)
 {
@@ -268,6 +281,23 @@ handle_libinput_data(int fd, uint32_t mask, void *data)
 		switch (libinput_event_get_type(generic_event)) {
 		case LIBINPUT_EVENT_DEVICE_ADDED:
 			device = libinput_event_get_device(generic_event);
+
+      /* disable libinput's built-in scroll-button conversion on pointing
+       * sticks — it buffers/replays BTN_MIDDLE press+release as a single
+       * burst on release, which confuses hevel's chord timing. we want raw,
+       * immediate button events instead. */
+
+      {
+        const char *name = libinput_device_get_name(device);
+        //fprintf(stderr, "device added: name=%s\n", name ? name : "(null)");
+
+        if (name && strcasestr(name, "trackpoint")) {
+          enum libinput_config_status status =
+              libinput_device_config_scroll_set_method(device, LIBINPUT_CONFIG_SCROLL_NO_SCROLL);
+          // fprintf(stderr, "trackpoint: set NO_SCROLL, status=%d\n", (int)status);
+        }
+      }
+
 			update_capabilities(seat, device_capabilities(device));
 			if (swc.manager->new_device) {
 				swc.manager->new_device(device);
@@ -307,6 +337,7 @@ handle_libinput_data(int fd, uint32_t mask, void *data)
 			time = libinput_event_pointer_get_time(event.p);
 			key = libinput_event_pointer_get_button(event.p);
 			state = libinput_event_pointer_get_button_state(event.p);
+			// fprintf(stderr, "libinput: button=%u state=%d\n", key, (int)state);
 			pointer_handle_button(&seat->pointer, time, key, state);
 			if (state == LIBINPUT_BUTTON_STATE_PRESSED) {
 				/* qemu generates GEAR_UP/GEAR_DOWN events on scroll, so pass
@@ -327,6 +358,39 @@ handle_libinput_data(int fd, uint32_t mask, void *data)
 			}
 			pointer_handle_frame(&seat->pointer);
 			break;
+
+		/* multi-touch */
+    case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+    case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
+    case LIBINPUT_EVENT_GESTURE_SWIPE_END: {
+      struct libinput_event_gesture *gevent =
+          libinput_event_get_gesture_event(generic_event);
+      uint32_t gtime = libinput_event_gesture_get_time(gevent);
+      int fingers = libinput_event_gesture_get_finger_count(gevent);
+      double dx = 0, dy = 0;
+      enum swc_gesture_phase phase;
+
+      switch (libinput_event_get_type(generic_event)) {
+      case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+        phase = SWC_GESTURE_BEGIN;
+        break;
+      case LIBINPUT_EVENT_GESTURE_SWIPE_END:
+        phase = SWC_GESTURE_END;
+        break;
+      default:
+        phase = SWC_GESTURE_UPDATE;
+        dx = libinput_event_gesture_get_dx(gevent);
+        dy = libinput_event_gesture_get_dy(gevent);
+        break;
+      }
+
+      if (gesture_handler) {
+        gesture_handler(gesture_handler_data, gtime, (uint32_t)fingers, phase, dx, dy);
+      }
+      break;
+    }
+    /* multi-touch */
+
 		case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
 			source = WL_POINTER_AXIS_SOURCE_WHEEL;
 			goto scroll;

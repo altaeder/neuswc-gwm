@@ -83,5 +83,5 @@ bind_output_manager(struct wl_client *client, void *data, uint32_t version, uint
 struct wl_global *
 xdg_output_manager_create(struct wl_display *display)
 {
-	return wl_global_create(display, &zxdg_output_manager_v1_interface, 3, NULL, &bind_output_manager);
+	return wl_global_create(display, &zxdg_output_manager_v1_interface, 2, NULL, &bind_output_manager);
 }
