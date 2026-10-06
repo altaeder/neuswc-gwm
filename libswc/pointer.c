@@ -632,6 +632,7 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 			pointer->cursor.surface = NULL;
 		}
 		view_attach(&pointer->cursor.view, NULL);
+		apply_cursor_override(pointer); // Ω important!
 		return;
 	}
 
