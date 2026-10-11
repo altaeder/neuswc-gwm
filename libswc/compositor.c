@@ -275,88 +275,6 @@ error0:
 
 /* Rendering {{{ */
 
-/* check the client's window buffer is opaque */
-static bool
-view_buffer_is_opaque(struct compositor_view *view)
-{
-	const struct swc_rectangle *geom = &view->base.geometry;
-	struct wld_buffer *buffer = view->base.buffer;
-	uint32_t x1, y1, width, height;
-
-  /* Ω
-    XRGB is opaque by definition.
-    Doing this avoids unneeded memcpy() calls. */
-  /*if (buffer->format == WLD_FORMAT_XRGB8888)
-	{
-		return true;
-	}*/
-
-	if (view->buffer_opaque_valid) {
-		return view->buffer_opaque;
-	}
-
-	view->buffer_opaque_valid = true;
-	view->buffer_opaque = false;
-
-  if (!buffer)
-  {
-  	view->buffer_opaque = false;
-    return false;
-  }
-
-	if (buffer->format != WLD_FORMAT_ARGB8888)
-	{
-  	view->buffer_opaque_valid = true;
-  	view->buffer_opaque = true;
-		return true;
-	}
-
-	if (view->window) {
-		if (view->buffer_offset_x < 0 || view->buffer_offset_y < 0) {
-     	view->buffer_opaque = false;
-			return false;
-		}
-		x1 = (uint32_t)view->buffer_offset_x;
-		y1 = (uint32_t)view->buffer_offset_y;
-		width = geom->width;
-		height = geom->height;
-	} else {
-		x1 = 0;
-		y1 = 0;
-		width = buffer->width;
-		height = buffer->height;
-	}
-
-	if (x1 > buffer->width || y1 > buffer->height ||
-	    width > buffer->width - x1 || height > buffer->height - y1 ||
-	    !wld_map(buffer)) {
-  	view->buffer_opaque = false;
-		return false;
-	}
-
-	//buffer->format = WLD_FORMAT_XRGB8888;
-	view->buffer_opaque = true;
-
-	for (uint32_t y = 0; y < height && view->buffer_opaque; ++y) {
-		const uint8_t *row = (const uint8_t *)buffer->map +
-		                     (size_t)(y1 + y) * buffer->pitch +
-		                     (size_t)x1 * 4;
-
-		for (uint32_t x = 0; x < width; ++x) {
-			uint32_t pixel;
-
-			memcpy(&pixel, row + (size_t)x * 4, sizeof(pixel));
-			if ((pixel >> 24) != 0xff) {
-				view->buffer_opaque = false;
-				break;
-			}
-		}
-	}
-
-	wld_unmap(buffer);
-	return view->buffer_opaque;
-}
-
 static void
 repaint_view(struct target *target, struct compositor_view *view,
              pixman_region32_t *damage)
@@ -420,28 +338,25 @@ repaint_view(struct target *target, struct compositor_view *view,
 			pixman_region32_init(&blend_damage);
 			pixman_region32_subtract(&blend_damage, &buffer_damage,
 			                         &opaque_damage);
-      // ↓ Ω BLUR time B-)
-      if (pixman_region32_not_empty(&view->surface->state.blur))
-      {
-        // ↓ Ω Shader call B-)
-        effects_apply(
-                      swc.backend->renderer,
-                      view,
-                      buf_x - target_geom->x, //x,
-                      buf_y - target_geom->y, //y);
-                      &blend_damage);
-      }
 
 			if (!pixman_region32_not_empty(&blend_damage) &&
 			     pixman_region32_not_empty(&buffer_damage))
 			{
-			/*||
-			    view_buffer_is_opaque(view)) {
-      */
   			wld_copy_region(swc.backend->renderer, view->buffer,
   				                buf_x - target_geom->x,
   				                buf_y - target_geom->y, &buffer_damage);
 			} else {
+        // ↓ Ω Shader time B-)
+        if (pixman_region32_not_empty(&view->surface->state.blur)) // blur check
+        {
+          effects_apply(
+                        swc.backend->renderer,
+                        view,
+                        buf_x - target_geom->x, //x,
+                        buf_y - target_geom->y, //y);
+                        &blend_damage);
+        }
+
 				wld_copy_region(swc.backend->renderer, view->buffer,
 				                buf_x - target_geom->x,
 				                buf_y - target_geom->y, &opaque_damage);
@@ -450,22 +365,9 @@ repaint_view(struct target *target, struct compositor_view *view,
 				                 buf_y - target_geom->y, &blend_damage);
 			}
 
-  		//view->buffer->format = WLD_FORMAT_XRGB8888;
 			pixman_region32_fini(&blend_damage);
 			pixman_region32_fini(&opaque_damage);
 		} else {
-      /*// ↓ Ω Blur time final frame
-      if (pixman_region32_not_empty(&view->surface->state.blur))
-      {
-        // ↓ Ω Shader call B-)
-        effects_apply(
-                      swc.backend->renderer,
-                      view,
-                      buf_x - target_geom->x, //x,
-                      buf_y - target_geom->y, //y);
-                      &buffer_damage);
-      }*/
-
 			wld_copy_region(swc.backend->renderer, view->buffer,
 			                buf_x - target_geom->x, buf_y - target_geom->y,
 			                &buffer_damage);
@@ -2280,20 +2182,8 @@ compositor_render_to_shm(struct screen *screen)
 			}
 			pixman_region32_fini(&source_region);
 
-      // ↓ init shader path,vreplace with above at some point
-      /* if (pixman_region32_not_empty(&view->surface->state.blur)) {
-          effects_apply(
-            swc.shm->renderer,
-            view->surface,
-            x,
-            y);
-      }*/
+      // SHADER: EFFECTS_APPLY CALL WAS HERE
 		}
-
-    /* HRMRMMR?!
-    if (pixman_region32_not_empty(&view->surface->state.blur))
-      effect_debug_color(...);
-    */
 
 		if ((view->border.outwidth > 0 || view->border.inwidth > 0) &&
 		    view->base.buffer) {
