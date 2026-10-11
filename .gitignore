@@ -13,5 +13,6 @@ protocol/*-protocol.[ch]
 /cursor/cursor_data.h
 /example/wm
 
+/result
 /build
 /*.patch

@@ -283,6 +283,14 @@ view_buffer_is_opaque(struct compositor_view *view)
 	struct wld_buffer *buffer = view->base.buffer;
 	uint32_t x1, y1, width, height;
 
+  /* Ω
+    XRGB is opaque by definition.
+    Doing this avoids unneeded memcpy() calls. */
+  /*if (buffer->format == WLD_FORMAT_XRGB8888)
+	{
+		return true;
+	}*/
+
 	if (view->buffer_opaque_valid) {
 		return view->buffer_opaque;
 	}
@@ -292,24 +300,20 @@ view_buffer_is_opaque(struct compositor_view *view)
 
   if (!buffer)
   {
+  	view->buffer_opaque = false;
     return false;
   }
 
-  /* Ω
-    XRGB is opaque by definition.
-    Doing this avoids unneeded memcpy() calls. */
-	if (buffer->format = WLD_FORMAT_XRGB8888)
-	{
-		return true;
-	}
-
 	if (buffer->format != WLD_FORMAT_ARGB8888)
 	{
-		return false;
+  	view->buffer_opaque_valid = true;
+  	view->buffer_opaque = true;
+		return true;
 	}
 
 	if (view->window) {
 		if (view->buffer_offset_x < 0 || view->buffer_offset_y < 0) {
+     	view->buffer_opaque = false;
 			return false;
 		}
 		x1 = (uint32_t)view->buffer_offset_x;
@@ -326,10 +330,13 @@ view_buffer_is_opaque(struct compositor_view *view)
 	if (x1 > buffer->width || y1 > buffer->height ||
 	    width > buffer->width - x1 || height > buffer->height - y1 ||
 	    !wld_map(buffer)) {
+  	view->buffer_opaque = false;
 		return false;
 	}
 
+	//buffer->format = WLD_FORMAT_XRGB8888;
 	view->buffer_opaque = true;
+
 	for (uint32_t y = 0; y < height && view->buffer_opaque; ++y) {
 		const uint8_t *row = (const uint8_t *)buffer->map +
 		                     (size_t)(y1 + y) * buffer->pitch +
@@ -345,8 +352,8 @@ view_buffer_is_opaque(struct compositor_view *view)
 			}
 		}
 	}
-	wld_unmap(buffer);
 
+	wld_unmap(buffer);
 	return view->buffer_opaque;
 }
 
@@ -425,11 +432,15 @@ repaint_view(struct target *target, struct compositor_view *view,
                       &blend_damage);
       }
 
-			if (!pixman_region32_not_empty(&blend_damage) ||
+			if (!pixman_region32_not_empty(&blend_damage) &&
+			     pixman_region32_not_empty(&buffer_damage))
+			{
+			/*||
 			    view_buffer_is_opaque(view)) {
-				wld_copy_region(swc.backend->renderer, view->buffer,
-				                buf_x - target_geom->x,
-				                buf_y - target_geom->y, &buffer_damage);
+      */
+  			wld_copy_region(swc.backend->renderer, view->buffer,
+  				                buf_x - target_geom->x,
+  				                buf_y - target_geom->y, &buffer_damage);
 			} else {
 				wld_copy_region(swc.backend->renderer, view->buffer,
 				                buf_x - target_geom->x,
@@ -439,10 +450,11 @@ repaint_view(struct target *target, struct compositor_view *view,
 				                 buf_y - target_geom->y, &blend_damage);
 			}
 
+  		//view->buffer->format = WLD_FORMAT_XRGB8888;
 			pixman_region32_fini(&blend_damage);
 			pixman_region32_fini(&opaque_damage);
 		} else {
-      // ↓ Ω Blur time final frame
+      /*// ↓ Ω Blur time final frame
       if (pixman_region32_not_empty(&view->surface->state.blur))
       {
         // ↓ Ω Shader call B-)
@@ -452,7 +464,7 @@ repaint_view(struct target *target, struct compositor_view *view,
                       buf_x - target_geom->x, //x,
                       buf_y - target_geom->y, //y);
                       &buffer_damage);
-      }
+      }*/
 
 			wld_copy_region(swc.backend->renderer, view->buffer,
 			                buf_x - target_geom->x, buf_y - target_geom->y,
