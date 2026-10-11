@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <errno.h>
 // Ω updated mesa impl
 
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
@@ -65,7 +66,7 @@ add(struct wl_client *client, struct wl_resource *resource, int32_t fd,
 		                       "buffer already created");
 		return;
 	}
-	if (i > ARRAY_LENGTH(params->fd)) {
+	if (i >= ARRAY_LENGTH(params->fd)) {
 		wl_resource_post_error(resource,
 		                       ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_PLANE_IDX,
 		                       "plane index too large");
@@ -208,6 +209,31 @@ error0:
 }
 
 // Ω updated mesa impl
+static bool
+write_all(int fd, const void *data, size_t size)
+{
+  const uint8_t *p = data;
+
+  while (size > 0)
+  {
+    ssize_t n = write(fd, p, size);
+
+    if (n < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+
+    if (n == 0)
+      return false;
+
+    p += n;
+    size -= (size_t)n;
+  }
+  return true;
+}
+
 static void
 feedback_destroy(struct wl_client *client, struct wl_resource *resource)
 {
@@ -239,12 +265,13 @@ send_default_feedback(struct wl_resource *resource)
   };
 
   struct stat st;
-  uint64_t device;
+  dev_t device;
   struct wl_array main_device = { 0 };
   struct wl_array tranche_device = { 0 };
   struct wl_array tranche_formats = { 0 };
-  int fd;
-  ssize_t size;
+  int fd = -1;
+  bool succes = false;
+  //ssize_t size;
 
   if (fstat(swc.drm->fd, &st) < 0 )
   {
@@ -252,26 +279,25 @@ send_default_feedback(struct wl_resource *resource)
     return false;
   }
 
+
 	/*
 	 * linux-dmabuf feedback expects the device as a dev_t,
 	 * represented as an 8-byte array.
 	 */
 
-  device = (uint64_t)makedev(major(st.st_rdev), minor(st.st_rdev));
+  device = st.st_rdev;
 
   fd = syscall(SYS_memfd_create, "swc-dmabuf-feedback", MFD_CLOEXEC);
   if (fd < 0)
   {
     ERROR("Could not create dmabuf feedback format table\n");
-    return false;
+    goto out;
   }
 
-  size = write(fd, formats, sizeof(formats));
-  if (size != (ssize_t)sizeof(formats))
+  if (!write_all(fd, formats, sizeof(formats)))
   {
     ERROR("Could not write dmabuf feedback format table\n");
-    close(fd);
-    return false;
+    goto out;
   }
 
   if (wl_array_add(&main_device, sizeof(device)) == NULL ||
@@ -283,7 +309,7 @@ send_default_feedback(struct wl_resource *resource)
 		wl_array_release(&main_device);
 		wl_array_release(&tranche_device);
 		wl_array_release(&tranche_formats);
-		return false;
+		goto out;
 	}
 
 	memcpy(main_device.data, &device, sizeof(device));
@@ -323,13 +349,19 @@ send_default_feedback(struct wl_resource *resource)
   zwp_linux_dmabuf_feedback_v1_send_tranche_done(resource);
   zwp_linux_dmabuf_feedback_v1_send_done(resource);
 
-  close(fd);
+  succes = true;
+
+  //close(fd);
+
+out:
+  if (fd >= 0)
+    close(fd);
 
   wl_array_release(&main_device);
   wl_array_release(&tranche_device);
   wl_array_release(&tranche_formats);
 
-  return true;
+  return succes;
 }
 
 static void
@@ -342,7 +374,7 @@ get_default_feedback(struct wl_client *client,
   feedback = wl_resource_create(
     client,
     &zwp_linux_dmabuf_feedback_v1_interface,
-    wl_resource_get_version(resource),
+    1,
     id);
 
   if (!feedback)
@@ -375,6 +407,7 @@ get_surface_feedback(struct wl_client *client,
 	 *
 	 * Surface-specific feedback can be implemented later.
 	 */
+  (void)surface;
 
   get_default_feedback(client, resource, id);
 }
@@ -407,13 +440,19 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 		return;
 	}
 	wl_resource_set_implementation(resource, &dmabuf_impl, NULL, NULL);
-	for (i = 0; i < ARRAY_LENGTH(formats); ++i) {
-		if (version >= 3) {
-			zwp_linux_dmabuf_v1_send_modifier(
-			    resource, formats[i], modifier >> 32, modifier & 0xffffffff);
-		} else {
-			zwp_linux_dmabuf_v1_send_format(resource, formats[i]);
-		}
+
+  if (version < 4)
+  {
+    for (i = 0; i < ARRAY_LENGTH(formats); ++i)
+    {
+      if (version >= 3)
+      {
+  			zwp_linux_dmabuf_v1_send_modifier(
+  			    resource, formats[i], modifier >> 32, modifier & 0xffffffff);
+		  } else {
+			  zwp_linux_dmabuf_v1_send_format(resource, formats[i]);
+		  }
+	  }
 	}
 }
 
