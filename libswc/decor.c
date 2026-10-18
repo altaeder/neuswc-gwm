@@ -491,7 +491,7 @@ decor_repaint(struct wld_renderer *renderer,
 	pixman_region32_subtract(&decor_region, &decor_region, &content_region);
 	pixman_region32_intersect(&decor_region, &decor_region, damage);
 	pixman_region32_subtract(&decor_region, &decor_region, &view->clip);
-	//if (!decor_parts_complete(view) &&
+	//if (!decor_parts_complete(view) && pixman_region32_not_empty(&decor_region)) {
 	if (pixman_region32_not_empty(&decor_region)) { // Ω Decor disable parts fill
 		pixman_region32_translate(&decor_region, -target_geom->x, -target_geom->y);
 		wld_fill_region(renderer, view->decor.color, &decor_region);

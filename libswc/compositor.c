@@ -1667,9 +1667,13 @@ void
 compositor_view_set_border_width(struct compositor_view *view,
                                  uint32_t outwidth, uint32_t inwidth)
 {
+  pixman_box32_t old_extents;
+
 	if (view->border.outwidth == outwidth && view->border.inwidth == inwidth) {
 		return;
 	}
+
+  old_extents = view->extents;
 
 	view->border.outwidth = outwidth;
 	view->border.damaged_border1 = true;
@@ -1680,6 +1684,24 @@ compositor_view_set_border_width(struct compositor_view *view,
 	/* XXX: Damage above surface for transparent surfaces? */
 
 	update_extents(view);
+
+	/* Damage old extents to prevent leftover border artifacts */
+	if (view->visible &&
+	    (old_extents.x1 != view->extents.x1 ||
+	     old_extents.y1 != view->extents.y1 ||
+	     old_extents.x2 != view->extents.x2 ||
+	     old_extents.y2 != view->extents.y2)) {
+		pixman_region32_t old_region, new_region;
+
+		pixman_region32_init_with_extents(&old_region, &old_extents);
+		pixman_region32_init_with_extents(&new_region, &view->extents);
+		pixman_region32_subtract(&old_region, &old_region, &new_region);
+		pixman_region32_union(&compositor.damage, &compositor.damage,
+		                      &old_region);
+		pixman_region32_fini(&old_region);
+		pixman_region32_fini(&new_region);
+	}
+
 	update(&view->base);
 }
 
@@ -2123,10 +2145,22 @@ compositor_render_to_shm(struct screen *screen)
 		return NULL;
 	}
 
+  // Ω get target
+  struct target *target = target_get(screen);
+  if (!target)
+  {
+    wld_buffer_unreference(buffer);
+    return NULL;
+  }
+  const struct swc_rectangle *target_geom = &target->view->geometry;
+
 	/* set region */
 	pixman_region32_init_rect(&region, 0, 0, width, height);
-	pixman_region32_init_rect(&damage, screen->base.geometry.x,
-	                          screen->base.geometry.y, width, height);
+	pixman_region32_init_rect(&damage,
+                            target_geom->x, target_geom->y,
+                            width, height);
+	/*pixman_region32_init_rect(&damage, screen->base.geometry.x,
+	                          screen->base.geometry.y, width, height);*/
 
 	/* background */
 	wld_fill_region(swc.shm->renderer, DEFAULT_BG, &region);
@@ -2165,8 +2199,8 @@ compositor_render_to_shm(struct screen *screen)
 			const struct swc_rectangle *geom = &view->base.geometry;
 			int32_t src_x = view->window ? view->buffer_offset_x : 0;
 			int32_t src_y = view->window ? view->buffer_offset_y : 0;
-			int32_t dst_x = geom->x - src_x - screen->base.geometry.x;
-			int32_t dst_y = geom->y - src_y - screen->base.geometry.y;
+			int32_t dst_x = geom->x - src_x - target_geom->x;
+			int32_t dst_y = geom->y - src_y - target_geom->y;
 			pixman_region32_t source_region;
 
 			pixman_region32_init_rect(&source_region, src_x, src_y, geom->width,
@@ -2187,47 +2221,71 @@ compositor_render_to_shm(struct screen *screen)
 
 		if ((view->border.outwidth > 0 || view->border.inwidth > 0) &&
 		    view->base.buffer) {
-			pixman_region32_t view_region, view_damage, border_damage;
+	    pixman_region32_t geom_region, border_region;
+			pixman_region32_t view_damage, border_damage;
+			pixman_region32_t in_rect, out_border, in_border;
+
 			const struct swc_rectangle *geom = &view->base.geometry;
-			const struct swc_rectangle *target_geom = &screen->base.geometry;
+      //const struct swc_rectangle *target_geom = &target->view->geometry;
 
-			pixman_region32_init_rect(&view_region, geom->x, geom->y,
-			                          geom->width, geom->height);
+      int64_t total_border =
+        (int64_t)view->border.outwidth +
+        (int64_t)view->border.inwidth;
+
+      // View geometry
+      pixman_region32_init_rect(&geom_region,
+                                geom->x, geom->y,
+                                geom->width, geom->height);
+
+      // Explicit geometry occupied by border
+      pixman_region32_init_rect(&border_region,
+                                geom->x - (int32_t)total_border,
+                                geom->y - (int32_t)total_border,
+                                geom->width + (uint32_t)(2 * total_border),
+                                geom->height + (uint32_t)(2 * total_border));
+      pixman_region32_subtract(&border_region, &border_region, &geom_region);
+
+
+      // only the visible & damaged parts
 			pixman_region32_init_with_extents(&view_damage, &view->extents);
-			pixman_region32_init(&border_damage);
-
-			pixman_region32_intersect(&view_damage, &view_damage, &damage);
+      pixman_region32_intersect(&view_damage,
+                                &view_damage, &damage);
 			pixman_region32_subtract(&view_damage, &view_damage, &view->clip);
-			pixman_region32_subtract(&border_damage, &view_damage,
-			                         &view_region);
 
-			pixman_region32_t in_rect;
-			pixman_region32_init_rect(&in_rect,
-			                          geom->x - view->border.inwidth,
-			                          geom->y - view->border.inwidth,
-			                          geom->width + (2 * view->border.inwidth),
-			                          geom->height +
-			                              (2 * view->border.inwidth));
+      // Certain damage to border properties Ω
+			pixman_region32_init(&border_damage);
+      pixman_region32_intersect(&border_damage,
+                                &view_damage, &border_region);
 
-			pixman_region32_t out_border;
-			pixman_region32_init(&out_border);
-			pixman_region32_subtract(&out_border, &border_damage, &in_rect);
+      // split outer and inner border, like repaint_view
+      pixman_region32_init_rect(&in_rect,
+                                geom->x - view->border.inwidth,
+                                geom->y - view->border.inwidth,
+                                geom->width + (2 * view->border.inwidth),
+                                geom->height + (2 * view->border.inwidth));
 
-			pixman_region32_t in_border;
-			pixman_region32_init(&in_border);
-			pixman_region32_subtract(&in_border, &in_rect, &view_region);
-			pixman_region32_intersect(&in_border, &in_border, &border_damage);
+      pixman_region32_init(&out_border);
+      pixman_region32_subtract(&out_border, &border_damage, &in_rect);
 
-			if (view->border.outwidth > 0 &&
-			    pixman_region32_not_empty(&out_border)) {
+      pixman_region32_init(&in_border);
+      pixman_region32_subtract(&in_border, &in_rect, &geom_region);
+      pixman_region32_intersect(&in_border, &in_border, &border_damage);
+
+      //Release Geom before drawing
+      pixman_region32_fini(&geom_region);
+      pixman_region32_fini(&border_region);
+      pixman_region32_fini(&view_damage);
+
+			if (view->border.outwidth > 0 && pixman_region32_not_empty(&out_border))
+			{
 				pixman_region32_translate(&out_border, -target_geom->x,
 				                          -target_geom->y);
 				wld_fill_region(swc.shm->renderer, view->border.outcolor,
 				                &out_border);
 			}
 
-			if (view->border.inwidth > 0 &&
-			    pixman_region32_not_empty(&in_border)) {
+			if (view->border.inwidth > 0 && pixman_region32_not_empty(&in_border))
+			{
 				pixman_region32_translate(&in_border, -target_geom->x,
 				                          -target_geom->y);
 				wld_fill_region(swc.shm->renderer, view->border.incolor,
@@ -2235,8 +2293,6 @@ compositor_render_to_shm(struct screen *screen)
 			}
 
 			pixman_region32_fini(&border_damage);
-			pixman_region32_fini(&view_region);
-			pixman_region32_fini(&view_damage);
 			pixman_region32_fini(&in_rect);
 			pixman_region32_fini(&out_border);
 			pixman_region32_fini(&in_border);
@@ -2244,12 +2300,19 @@ compositor_render_to_shm(struct screen *screen)
 
 		if (view->decor.top || view->decor.right || view->decor.bottom ||
 		    view->decor.left) {
-			const struct swc_rectangle *target_geom = &screen->base.geometry;
+
+      /*struct target *target;
+      if (!(target = target_get(screen))) {
+        continue;
+      } */
+
+			//const struct swc_rectangle *target_geom = &screen->base.geometry;
+			//decor_repaint(swc.shm->renderer, target_geom, view, &damage);
 			decor_repaint(swc.shm->renderer, target_geom, view, &damage);
 		}
 	}
 
-	draw_overlays(swc.shm->renderer, &screen->base.geometry);
+  draw_overlays(swc.shm->renderer, target_geom);
 
 	wld_flush(swc.shm->renderer);
 	pixman_region32_fini(&region);
